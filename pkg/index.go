@@ -18,11 +18,15 @@ const indexHtml = `<html lang="en">
             display: flex;
             flex-wrap: wrap;
         }
+
+        .panel {
+            margin-bottom: 15px;
+        }
     </style>
 </head>
 <body>
-<div>
-    <form method="post" action="/add">Youtube URL: <input name='url'> <input type="submit" value="Start Downloading"></form>
+<div class="panel">
+    Youtube URL: <input name='url'> <button id="add-btn">Start Converting</button>
 </div>
 <div id="root"></div>
 
@@ -70,7 +74,7 @@ const indexHtml = `<html lang="en">
         <label></label>
         <div class="sep"></div>
         <progress max="100"></progress>
-        <a href="">Download</a>
+        <a href="" target="_blank">Download</a>
     </div>
     <code></code>
 </template>
@@ -87,6 +91,8 @@ const indexHtml = `<html lang="en">
             this.progressEl = this.shadowRoot.querySelector("progress");
             this.linkEl = this.shadowRoot.querySelector("a");
             this.errorEl = this.shadowRoot.querySelector("code");
+            this.hasLink = false;
+            this.progressEnabled = true;
         }
 
         static get observedAttributes() {
@@ -102,18 +108,19 @@ const indexHtml = `<html lang="en">
                     this.statusEl.innerText = newValue;
                     break;
                 case 'progress':
-                    if (newValue !== "0" && newValue !== "") {
+                    const progerss = Number(newValue);
+                    this.progressEnabled = true;
+                    
+                    if (progerss > 0) {
                         this.progressEl.value = newValue;
+                    } else if (progerss < 0) {
+                        this.progressEnabled = false;
                     } else {
                         this.progressEl.removeAttribute("value");
                     }
                     break;
                 case 'link':
-                    if (newValue === "") {
-                        this.progressEl.style.display = 'block';
-                    } else {
-                        this.progressEl.style.display = 'none';
-                    }
+                    this.hasLink = newValue !== "";
 
                     this.linkEl.href = newValue;
                     break;
@@ -121,6 +128,12 @@ const indexHtml = `<html lang="en">
                     this.errorEl.innerText = newValue ? "Error: " + newValue : "";
                     break;
             }
+            
+            this.progressEl.style.display = this.hasLink 
+                ? "none" 
+                : this.progressEnabled 
+                    ? "block" 
+                    : "none";
         }
     }
 
@@ -151,6 +164,22 @@ const indexHtml = `<html lang="en">
         item.setAttribute('link', data.downloadUrl);
         item.setAttribute('error', data.error);
     }
+    
+    function addNew(youtubeUrl) {
+        fetch("//{{.Host}}/add", {
+            method: "POST",
+            body: JSON.stringify({url: youtubeUrl}),
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        }); 
+    }
+    
+    document.getElementById('add-btn').addEventListener('click', ev => {
+        const inp = document.querySelector('input[name=url]');
+        addNew(inp.value);
+        inp.value = "";
+    });
 
     fetch("/get").then(r => r.json()).then(r => {
         for (const d of r) {

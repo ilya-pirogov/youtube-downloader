@@ -17,67 +17,69 @@ import (
 
 type worker struct {
 	*State
-	uri url.URL
+	uri          url.URL
+	baseFileName string
+	mp4File      string
+	mp3File      string
 }
 
 type dispatcher struct {
-	newTask    chan url.URL
+	newTask    chan *worker
 	connect    chan chan State
 	disconnect chan chan State
 	update     chan State
+	converter  chan *worker
 	pool       []*worker
 	lock       sync.RWMutex
 }
 
 func NewDispatcher() *dispatcher {
 	return &dispatcher{
-		newTask:    make(chan url.URL),
+		newTask:    make(chan *worker),
 		connect:    make(chan chan State),
 		disconnect: make(chan chan State),
 		update:     make(chan State, 0),
 		pool:       make([]*worker, 0),
+		converter:  make(chan *worker, 16),
 	}
 }
 
-func (d *dispatcher) Start() {
+func (d *dispatcher) Downloading() {
 	clients := make([]chan State, 0)
 
 	for {
 		select {
-		case uri := <-d.newTask:
-			w := &worker{&State{
-				Url:    uri.String(),
-				Status: "Starting",
-			}, uri}
+		case w := <-d.newTask:
+			d.lock.Lock()
+			d.pool = append(d.pool, w)
+			d.lock.Unlock()
 
+			log.Printf("Added: %s (%s)", w.Url, w.Vid.Title)
 			go func() {
-				if err := w.fetchMeta(); err != nil {
+				file, _ := os.Create(w.mp4File)
+
+				if err := w.Download(d.update, file); err != nil {
 					log.Println(err)
-					log.Printf("Unable to add %s", uri.String())
+					w.Error = err.Error()
+					d.update <- *w.State
 					return
 				}
 
-				d.lock.RLock()
-				for _, ww := range d.pool {
-					if ww.Vid.ID == w.Vid.ID {
-						log.Printf("Video %s is already downloaded", w.Vid.ID)
-						d.lock.RUnlock()
-						return
-					}
+				w.Status = "Scheduled"
+				w.Percent = -1
+				d.update <- *w.State
+
+				if err := file.Close(); err != nil {
+					log.Println(err)
 				}
-				d.lock.RUnlock()
 
-				d.lock.Lock()
-				d.pool = append(d.pool, w)
-				d.lock.Unlock()
-
-				log.Printf("Added: %s", uri.String())
-				go w.Start(d.update)
+				d.converter <- w
 			}()
 
 		case upd := <-d.connect:
 			clients = append(clients, upd)
 			log.Printf("Connect: %d", len(clients))
+
 		case upd := <-d.disconnect:
 			for k, v := range clients {
 				if v == upd {
@@ -86,6 +88,7 @@ func (d *dispatcher) Start() {
 				}
 			}
 			log.Printf("Disconnect: %d", len(clients))
+
 		case state := <-d.update:
 			for _, q := range clients {
 				q <- state
@@ -101,56 +104,42 @@ func (w *worker) fetchMeta() error {
 		return err
 	}
 	w.Vid = vid
+
+	w.baseFileName = sanitizeFilename(w.Vid.Title)
+
+	w.mp4File = path.Join("out", w.baseFileName+".mp4")
+	w.mp3File = path.Join("out", w.baseFileName+".mp3")
 	return nil
 }
 
-func (w *worker) Start(q chan State) {
+func (w *worker) Download(q chan State, fp *os.File) error {
+	var (
+		downUrl *url.URL
+		resp    *http.Response
+		err     error
+		wg      sync.WaitGroup
+	)
+
 	q <- *w.State
 
-	downUrl, err := w.Vid.GetDownloadURL(w.Vid.Formats[0])
-	if err != nil {
-		log.Println(err)
-		w.Error = err.Error()
-		q <- *w.State
-		return
+	if downUrl, err = w.Vid.GetDownloadURL(w.Vid.Formats[0]); err != nil {
+		return err
 	}
 
-	resp, err := http.Head(downUrl.String())
-	if err != nil {
-		log.Println(err)
-		w.Error = err.Error()
-		q <- *w.State
-		return
+	if resp, err = http.Head(downUrl.String()); err != nil {
+		return err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		w.Error = fmt.Sprintf("Status code: %d", resp.StatusCode)
-		q <- *w.State
-		return
+		return fmt.Errorf("status code: %d", resp.StatusCode)
 	}
 
-	// the Header "Content-Length" will let us know
-	// the total file size to download
 	size, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
 	w.DownloadSize = int64(size)
 
-	mp4File := path.Join("out", w.Vid.Title+".mp4")
-	mp3File := path.Join("out", w.Vid.Title+".mp3")
+	r := progress.NewWriter(fp)
 
-	file, _ := os.Create(mp4File)
-	defer func() {
-		if err := file.Close(); err != nil {
-			log.Println(err)
-		}
-
-		if err := os.Remove(mp4File); err != nil {
-			log.Println(err)
-		}
-	}()
-
-	var wg sync.WaitGroup
 	wg.Add(1)
-	r := progress.NewWriter(file)
 	go func() {
 		ctx := context.Background()
 		progressChan := progress.NewTicker(ctx, r, w.DownloadSize, 100*time.Millisecond)
@@ -166,42 +155,10 @@ func (w *worker) Start(q chan State) {
 	w.Status = "Downloading"
 	q <- *w.State
 
-	err = w.Vid.Download(w.Vid.Formats[0], r)
-	if err != nil {
-		log.Println(err)
-		w.Error = err.Error()
-		return
+	if err = w.Vid.Download(w.Vid.Formats[0], r); err != nil {
+		return err
 	}
 
 	wg.Wait()
-	w.Status = "Processing"
-	w.Percent = 0
-	q <- *w.State
-
-	err = trans.Initialize(mp4File, mp3File)
-	if err != nil {
-		log.Println(err)
-		w.Error = err.Error()
-		q <- *w.State
-	}
-
-	done := trans.Run(false)
-	pr := trans.Output()
-	go func() {
-		for msg := range pr {
-			w.Error = msg.FramesProcessed
-			q <- *w.State
-		}
-	}()
-
-	err = <-done
-	if err != nil {
-		log.Println(err)
-		w.Error = err.Error()
-		q <- *w.State
-	}
-
-	w.DownloadUrl = "/result/" + w.Vid.Title + ".mp3"
-	w.Status = "Done"
-	q <- *w.State
+	return nil
 }

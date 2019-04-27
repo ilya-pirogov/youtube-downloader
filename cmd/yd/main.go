@@ -37,6 +37,7 @@ func main() {
 		ReadTimeout:  15 * time.Second,
 	}
 
-	go d.Start()
+	go d.Downloading()
+	go d.Converting()
 	log.Fatal(srv.ListenAndServe())
 }
